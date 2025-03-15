@@ -9,20 +9,19 @@
 #include <queue>
 #include <atomic>
 enum class EventID { Null, OnGroupMsg, OnFriendMsg };
-//class Event
-//{
-//public:
-//	const EventID id = EventID::Null;
-//	std::queue<std::function<void(const Event& event)>> funcs;
-//	Event(std::function<void(const Event& event)> func, EventID id) : id(id) {
-//		funcs.emplace(func);
-//	}
-//	void operator()() {
-//
-//	}
-//	~Event() {
-//	}
-//};
+class Event
+{
+public:
+	const EventID id = EventID::Null;
+	std::queue<std::function<void(const Event& event)>> funcs;
+	Event(std::function<void(const Event& event)> func, EventID id) : id(id) {
+		funcs.emplace(func);
+	}
+	void operator()() {
+	}
+	~Event() {
+	}
+};
 class EventBus {
 	std::map<EventID, std::queue<std::function<void(const Event& event)>>> events;
 	std::atomic<bool> lock;
