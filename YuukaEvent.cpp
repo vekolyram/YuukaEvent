@@ -37,24 +37,25 @@ private:
 	std::map<int, std::deque<Event*> > waiting;
 	std::mutex eventsMtx, waitingMtx;
 	std::unique_lock<std::mutex> waitingLock = std::unique_lock<std::mutex>(waitingMtx);
-	void doOne(Event* _, bool delay = false, int index = 0) {
+	std::map<int, std::vector<Event>> doOne(Event* _, bool delay = false, int index = 0) {
 		EventInfo ccb = *(_->info);
 		ccb.CountSub();//nobreak
 		switch ((*_).info->mode)
 		{
 		case Count:
-			if (_->info->getCount() <= 0 && !delay)
-				if (!delay) {
-					yuukaLock(eventsMtx);
-					std::map<int, std::vector<Event>> eventMap = events;
-					eventMap[_->info->id].erase(eventMap[_->info->id].begin() + index);
-					events = (eventMap);
-				}
+			//delay to another fn
+			if (_->info->getCount() <= 0 && !delay) {
+				std::unique_lock<std::mutex> _lock = std::unique_lock<std::mutex>(eventsMtx);
+				std::map<int, std::vector<Event>> eventMap = events;
+				eventMap[_->info->id].erase(eventMap[_->info->id].begin() + index);
+				events = (eventMap);
+			}
 			[[fallthrough]];
 		case Repeat:
 			(*_)();
 			break;
 		}
+		return events;
 	}
 public:
 	EventBus() {}
@@ -66,8 +67,8 @@ public:
 		events[id].swap(nil);
 	}
 	void triggerEvent(int id) {
-		auto _ = events[id][0];
-		for (int index = 0; index < events[id].size();_ = events[id][++index]) {
+		auto& _ = events[id][0];
+		for (int index = 0; index + 1 < events[id].size();_ = events[id][++index]) {
 			if (_.info->type == Delay) {
 				if (_.info->priority == High)
 					waiting[id].push_front(&_);
@@ -75,16 +76,18 @@ public:
 					waiting[id].push_back(&_);
 				break;
 			}
-			std::async(std::launch::async, [=]() {
-				Event ptr = _;
-				doOne(&ptr, false, index);});
+			else {
+				std::async(std::launch::async, [=]() mutable {
+					doOne(&_, false, index);
+					});
+			}
 		}
 		std::cout << "event done" << std::endl;
 	}
 	void delayQueueRun(int id) {
 		yuukaLock(waitingMtx);
 		while (waiting[id].size() == 0) {
-			if (events.count(waiting[id].front()->info->id) > 0) {
+			if (events.count(waiting[id].front()->info->id) == 0 || waiting[id].front()->info->getCount() <= 0) {
 				waiting[id].pop_front();
 				continue;
 			}
