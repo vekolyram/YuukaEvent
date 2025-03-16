@@ -23,75 +23,77 @@ public:
 };
 class Event {
 public:
-	const EventInfo* info;
+	const std::shared_ptr<EventInfo> info;
 	std::function<void(Event* event)> func;
-	Event(const EventInfo* info, std::function<void(const Event* event)> func = [](const Event* event) {}) : info(info), func(func) {}
-	void operator()() { func(this); }
-	bool operator<(const Event& other) {
-		return static_cast<int>(this->info->priority) < static_cast<int>(other.info->priority);
-	}
+	Event(const std::shared_ptr<EventInfo> info, std::function<void(const Event* event)> func = [](const Event* event) {}) : info(info), func(func) {}
+	void operator()() { func(this); }	//bool operator<(const Event& other) {return static_cast<int>(this->info->priority) < static_cast<int>(other.info->priority);}
 };
 class EventBus {
 private:
-	std::map<int, std::vector<Event> > events;
-	std::map<int, std::deque<Event*> > waiting;
+	struct EventGroup {
+	public: std::mutex mtx; std::vector<Event> events;
+	};
+	std::map<int, EventGroup > eventGroups;
+	std::map<int, std::deque<std::shared_ptr<EventGroup> > > waitingGroups;
 	std::mutex eventsMtx, waitingMtx;
 	std::unique_lock<std::mutex> waitingLock = std::unique_lock<std::mutex>(waitingMtx);
-	std::map<int, std::vector<Event>> doOne(Event* _, bool delay = false, int index = 0) {
-		EventInfo ccb = *(_->info);
-		ccb.CountSub();//nobreak
-		switch ((*_).info->mode)
+	void processEvent(std::shared_ptr<Event> fn, bool delay = false, int index = 0) {
+		EventInfo eventInfo = *(fn->info);
+		switch ((*fn).info->mode)
 		{
 		case Count:
-			//delay to another fn
-			if (_->info->getCount() <= 0 && !delay) {
-				std::unique_lock<std::mutex> _lock = std::unique_lock<std::mutex>(eventsMtx);
-				std::map<int, std::vector<Event>> eventMap = events;
-				eventMap[_->info->id].erase(eventMap[_->info->id].begin() + index);
-				events = (eventMap);
+			if (fn->info->getCount() - 1 >= 0 && !delay) {//delay to another fn
+				eventInfo.CountSub();//nobreak
 			}
 			[[fallthrough]];
 		case Repeat:
-			(*_)();
+			(*fn)();
 			break;
 		}
-		return events;
 	}
 public:
 	EventBus() {}
 	void addEvent(int id, Event e) {
-		events[id].emplace_back(e);
+		yuukaLock(eventGroups[id].mtx);
+		eventGroups[id].events.emplace_back(e);
 	}
 	void removeEvent(int id, Event e) {
 		std::vector<Event> nil;
-		events[id].swap(nil);
+		yuukaLock(eventGroups[id].mtx);
+		eventGroups[id].events.swap(nil);
 	}
 	void triggerEvent(int id) {
-		auto& _ = events[id][0];
-		for (int index = 0; index + 1 < events[id].size();_ = events[id][++index]) {
-			if (_.info->type == Delay) {
-				if (_.info->priority == High)
-					waiting[id].push_front(&_);
-				else
-					waiting[id].push_back(&_);
-				break;
-			}
-			else {
-				std::async(std::launch::async, [=]() mutable {
-					doOne(&_, false, index);
-					});
-			}
+		std::vector<std::shared_ptr<Event>> eventsToProcess;
+		{
+			yuukaLock(eventsMtx);
+			if (eventGroups.find(id) == eventGroups.end()) return;
+			for (auto& e : eventGroups[id].events)
+				eventsToProcess.emplace_back(std::make_shared<Event>(e));
 		}
-		std::cout << "event done" << std::endl;
+		std::async(std::launch::async, [this, eventsToProcess, id]() {
+			for (auto& event : eventsToProcess) {
+				if (event->info->type == Delay) {
+					yuukaLock(waitingGroups[id]->mtx);//waiting group gg
+					if (event->info->priority == High)
+						waiting[event->info->id].emplace_front(event);
+					else
+						waiting[event->info->id].emplace_back(event);
+				}
+				else {
+					processEvent(event, false);
+				}
+			}
+			std::cout << "event done" << std::endl;
+			});
 	}
 	void delayQueueRun(int id) {
 		yuukaLock(waitingMtx);
-		while (waiting[id].size() == 0) {
+		while (waiting[id].size() > 0) {
 			if (events.count(waiting[id].front()->info->id) == 0 || waiting[id].front()->info->getCount() <= 0) {
 				waiting[id].pop_front();
 				continue;
 			}
-			doOne(*(&waiting[id].front()), true);
+			processEvent(*(&waiting[id].front()), true);
 			waiting[id].pop_front();
 		}
 	}
@@ -100,7 +102,7 @@ int main()
 {
 	EventBus bus;
 	EventInfo info(0x1, AtOnce, High, Repeat);
-	bus.addEvent(0x1, Event(&info, ([](const Event* event) {
+	bus.addEvent(0x1, Event(std::make_shared<EventInfo>(info), ([](const Event* event) mutable {
 		std::cout << event->info->getCount();
 		})));
 	bus.triggerEvent(0x1);
