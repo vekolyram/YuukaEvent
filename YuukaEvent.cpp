@@ -65,7 +65,7 @@ public:
 	void triggerEvent(int id) {
 		std::vector<std::shared_ptr<Event>> eventsToProcess;
 		{
-			yuukaLock(eventsMtx);
+			yuukaLock(eventsMtx);//
 			if (eventGroups.find(id) == eventGroups.end()) return;
 			for (auto& e : eventGroups[id].events)
 				eventsToProcess.emplace_back(std::make_shared<Event>(e));
