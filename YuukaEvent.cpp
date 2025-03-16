@@ -6,21 +6,24 @@
 #include <mutex>
 #include <shared_mutex>
 #define yuukaLock(x) std::unique_lock<std::shared_mutex> _lock = std::unique_lock<std::shared_mutex>(x)
-enum EventRunType { AtOnce, Delay };
-enum EventPriority { Low, High };
-enum EventMode { Count, Repeat };
+enum EventRunType { Immediate, Delay };
 struct EventInfo {
 private:
-	int count = 1;
+	int count = 10;
 public:
 	const int id = -1;
-	const EventRunType type = AtOnce;
-	const EventPriority priority = Low;
-	const EventMode mode = Repeat;
-	void CountSub() { count--; }
+	const EventRunType type = Immediate;
+	void countSub() { count--; }
 	int getCount() const { return count; }
-	EventInfo(int id, EventRunType type, EventPriority priority, EventMode mode, int count = 1) :id(id), type(type), priority(priority), mode(mode), count(count) {}
+	EventInfo(int id, EventRunType type, int count = 1) :id(id), type(type), count(count) {}
 	EventInfo() {}
+};
+class EventRedirector {
+public:
+	const virtual void doDelayTasksDeque(Event* event, int delayID, int immeID);
+	std::deque < std::shared_ptr<Event> > delayDeque;
+	const virtual void doTasksDeque(Event* event, int index);
+	std::deque<Event> immediateDeque;
 };
 class Event {
 public:
@@ -33,77 +36,77 @@ class EventBus {
 private:
 	struct EventGroup {
 	public: std::shared_mutex mtx, mtx1;
-		  std::vector<Event> events;
-		  std::deque<std::shared_ptr<Event> > waitings;
-		  std::atomic<bool> newTaskFlag, exitFlag = false;
-		  std::thread thread = std::thread([=](id) {while (!exitFlag.load()) {}});
-		  ~EventGroup() { thread.join(); }
+		  EventRedirector& redirector;
+		  std::deque<Event>& tasksDeque;
+		  std::deque<std::shared_ptr<Event> >& delayTasksDeque = redirector.delayDeque;
+		  std::atomic<bool> newTaskFlag, exitFlag, delay = false;
+		  std::thread thread = std::thread([&](auto& tasks) {
+			  while (!exitFlag.load()) {
+				  newTaskFlag.wait(false);
+				  if (exitFlag.load()) break;
+				  for (int i = 0; i < tasks.size(); i++) {
+					  auto& e = tasks[i];
+					  if (e.info->mode == Once || e.info->getCount() <= 0)
+						  tasks.erase(tasks.begin() + i--);
+					  if (e.info->mode == Count)
+						  e.info->countSub();
+					  if (e.info->type == Delay)
+						  delayTasksDeque.emplace_front(std::make_shared<Event>(e));
+					  if (e.info->type == Immediate) {
+						  e();
+						  break;
+					  }
+				  }
+			  }
+			  newTaskFlag.store(false);
+			  }, tasksDeque);
+		  void operator()() {
+			  newTaskFlag.store(true);
+			  newTaskFlag.notify_all();
+		  }
+		  ~EventGroup() {
+			  exitFlag.store(false);
+			  thread.join();
+		  }
 	};
 	std::map<int, EventGroup > eventGroups;
-	void processEvent(std::shared_ptr<Event> fn, bool delay = false, int index = 0) {
-		EventInfo eventInfo = *(fn->info);
-		switch ((*fn).info->mode)
-		{
-		case Count:
-			if (fn->info->getCount() - 1 >= 0 && !delay) {//delay to another fn
-				eventInfo.CountSub();//nobreak
-			} [[fallthrough]];
-		case Repeat:
-			(*fn)();
-			break;
-		}
-	}
+	EventRedirector redirector;
 public:
 	EventBus() {}
-	void addEvent(int id, Event e) {
+	int addEvent(int id, Event e) {
 		yuukaLock(eventGroups[id].mtx);
-		eventGroups[id].events.emplace_back(e);
+		eventGroups[id].tasksDeque.emplace_front(e);
+		return eventGroups[id].tasksDeque.size() - 1;
 	}
-	void removeEvent(int id, Event e) {
-		std::vector<Event> nil;
+	void removeAllEvent(int id) {
+		std::deque<Event> nil;
 		yuukaLock(eventGroups[id].mtx);
-		eventGroups[id].events.swap(nil);
+		eventGroups[id].tasksDeque.swap(nil);
+	}
+	void removeEvent(int id, int index) {
+		yuukaLock(eventGroups[id].mtx);
+		eventGroups[id].tasksDeque.erase(eventGroups[id].tasksDeque.begin() + index);
 	}
 	void triggerEvent(int id) {
-		std::vector<std::shared_ptr<Event>> eventsToProcess;
-		{
-			yuukaLock(eventGroups[id].mtx1);
-			if (eventGroups.find(id) == eventGroups.end()) return;
-			for (auto& e : eventGroups[id].events)
-				eventsToProcess.emplace_back(std::make_shared<Event>(e));
-		}
-		std::async(std::launch::async, [this, eventsToProcess, id]() {
-			for (auto& event : eventsToProcess) {
-				if (event->info->type == Delay) {
-					yuukaLock(eventGroups[id].mtx1);
-					if (event->info->priority == High)
-						eventGroups[id].waitings.emplace_front(event);
-					else
-						eventGroups[id].waitings.emplace_back(event);
-				}
-				else {
-					processEvent(event, false);
-				}
-			}
-			std::cout << "event done" << std::endl;
-			});
+		yuukaLock(eventGroups[id].mtx1);
+		if (eventGroups.find(id) == eventGroups.end()) return;
+		eventGroups[id]();
 	}
 	void delayQueueRun(int id) {
 		yuukaLock(eventGroups[id].mtx1);
-		while (eventGroups[id].waitings.size() > 0) {
-			if (eventGroups[id].waitings.front()->info->getCount() <= 0) {
-				eventGroups[id].waitings.pop_front();
+		while (eventGroups[id].delayTasksDeque.size() > 0) {
+			if (eventGroups[id].delayTasksDeque.front()->info->getCount() <= 0) {
+				eventGroups[id].delayTasksDeque.pop_front();
 				continue;
 			}
-			processEvent(*(&eventGroups[id].waitings.front()), true);
-			eventGroups[id].waitings.pop_front();
+			eventGroups[id].doDelayTasksDeque();
 		}
 	}
 };
 int main()
 {
 	EventBus bus;
-	EventInfo info(0x1, AtOnce, High, Repeat);
+	EventInfo info(0x1, Immediate, Repeat);
 	bus.addEvent(0x1, Event(std::make_shared<EventInfo>(info), ([](const Event* event) mutable {
 		std::cout << event->info->getCount();
 		})));
