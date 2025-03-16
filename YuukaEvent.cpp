@@ -4,7 +4,8 @@
 #include <future>
 #include <queue>
 #include <mutex>
-#define yuukaLock(x) std::unique_lock<std::mutex> _lock = std::unique_lock<std::mutex>(x)
+#include <shared_mutex>
+#define yuukaLock(x) std::unique_lock<std::shared_mutex> _lock = std::unique_lock<std::shared_mutex>(x)
 enum EventRunType { AtOnce, Delay };
 enum EventPriority { Low, High };
 enum EventMode { Count, Repeat };
@@ -31,12 +32,14 @@ public:
 class EventBus {
 private:
 	struct EventGroup {
-	public: std::mutex mtx; std::vector<Event> events;
+	public: std::shared_mutex mtx, mtx1;
+		  std::vector<Event> events;
+		  std::deque<std::shared_ptr<Event> > waitings;
+		  std::atomic<bool> newTaskFlag, exitFlag = false;
+		  std::thread thread = std::thread([=](id) {while (!exitFlag.load()) {}});
+		  ~EventGroup() { thread.join(); }
 	};
 	std::map<int, EventGroup > eventGroups;
-	std::map<int, std::deque<std::shared_ptr<EventGroup> > > waitingGroups;
-	std::mutex eventsMtx, waitingMtx;
-	std::unique_lock<std::mutex> waitingLock = std::unique_lock<std::mutex>(waitingMtx);
 	void processEvent(std::shared_ptr<Event> fn, bool delay = false, int index = 0) {
 		EventInfo eventInfo = *(fn->info);
 		switch ((*fn).info->mode)
@@ -44,8 +47,7 @@ private:
 		case Count:
 			if (fn->info->getCount() - 1 >= 0 && !delay) {//delay to another fn
 				eventInfo.CountSub();//nobreak
-			}
-			[[fallthrough]];
+			} [[fallthrough]];
 		case Repeat:
 			(*fn)();
 			break;
@@ -65,7 +67,7 @@ public:
 	void triggerEvent(int id) {
 		std::vector<std::shared_ptr<Event>> eventsToProcess;
 		{
-			yuukaLock(eventsMtx);//
+			yuukaLock(eventGroups[id].mtx1);
 			if (eventGroups.find(id) == eventGroups.end()) return;
 			for (auto& e : eventGroups[id].events)
 				eventsToProcess.emplace_back(std::make_shared<Event>(e));
@@ -73,11 +75,11 @@ public:
 		std::async(std::launch::async, [this, eventsToProcess, id]() {
 			for (auto& event : eventsToProcess) {
 				if (event->info->type == Delay) {
-					yuukaLock(waitingGroups[id]->mtx);//waiting group gg
+					yuukaLock(eventGroups[id].mtx1);
 					if (event->info->priority == High)
-						waiting[event->info->id].emplace_front(event);
+						eventGroups[id].waitings.emplace_front(event);
 					else
-						waiting[event->info->id].emplace_back(event);
+						eventGroups[id].waitings.emplace_back(event);
 				}
 				else {
 					processEvent(event, false);
@@ -87,14 +89,14 @@ public:
 			});
 	}
 	void delayQueueRun(int id) {
-		yuukaLock(waitingMtx);
-		while (waiting[id].size() > 0) {
-			if (events.count(waiting[id].front()->info->id) == 0 || waiting[id].front()->info->getCount() <= 0) {
-				waiting[id].pop_front();
+		yuukaLock(eventGroups[id].mtx1);
+		while (eventGroups[id].waitings.size() > 0) {
+			if (eventGroups[id].waitings.front()->info->getCount() <= 0) {
+				eventGroups[id].waitings.pop_front();
 				continue;
 			}
-			processEvent(*(&waiting[id].front()), true);
-			waiting[id].pop_front();
+			processEvent(*(&eventGroups[id].waitings.front()), true);
+			eventGroups[id].waitings.pop_front();
 		}
 	}
 };
